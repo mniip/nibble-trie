@@ -1,0 +1,24 @@
+cabal-version:       >=1.10
+name:                nibble-trie
+version:             0.1.0.0
+synopsis:            An efficient trie keyed by a bitstring
+description:         An efficient trie keyed by a bitstring.
+homepage:            https://github.com/mniip/nibble-trie
+license:             BSD3
+license-file:        LICENSE
+author:              mniip
+maintainer:          mniip@mniip.com
+copyright:           (C) 2018 mniip
+category:            Data
+build-type:          Simple
+
+library
+  exposed-modules:     Data.Trie.Nibble.Internal,
+                       Data.Trie.Nibble.NibbleQuery
+  build-depends:       base == 4.*,
+                       ghc-prim,
+                       integer-gmp,
+                       primitive >= 0.6.2.0
+  hs-source-dirs:      src
+  default-language:    Haskell2010
+  ghc-options:         -Wall
