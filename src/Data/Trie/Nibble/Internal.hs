@@ -15,12 +15,15 @@ module Data.Trie.Nibble.Internal
   , lookup
   , findWithDefault
   , toList
+  , foldr
+  , foldrWithKey
 
   , empty
   , singleton
 
   , fromList
   , insert
+  , insertWith
   , union
   , unionWith
   , unionWithKey
@@ -36,10 +39,15 @@ import Data.Maybe
 import Data.Primitive.SmallArray
 import Data.Trie.Nibble.NibbleQuery
 import Data.Word
+import GHC.Exts (inline)
 import GHC.Prim
 import GHC.Types
 import Prelude hiding (null, lookup)
 import Text.Show
+
+{-----------------------------------------------------------------------------
+ - Types                                                                     -
+ -----------------------------------------------------------------------------}
 
 type Offset = Word
 type Mask = Word16
@@ -57,6 +65,10 @@ data Trie k v = Nil
                 -- ^ Same as 'Node' but @mask@ is assumed to be @0xFFFF@ and the nibble at offset @offt@ can be seen as an index into @arr@.
               deriving (Eq, Functor, Foldable, Traversable)
 
+{-----------------------------------------------------------------------------
+ - Patterns                                                                  -
+ -----------------------------------------------------------------------------}
+
 -- | Abstraction over 'Node' and a 'Full'.
 pattern NF :: k -> Offset -> Mask -> SmallArray (Trie k v) -> Trie k v
 pattern NF crumb offt mask arr <- (matchNF -> Just (crumb, offt, mask, arr))
@@ -69,6 +81,9 @@ matchNF (Node crumb offt mask arr) = Just (crumb, offt, mask, arr)
 matchNF (Full crumb offt arr) = Just (crumb, offt, 0xFFFF, arr)
 matchNF _ = Nothing
 
+{-----------------------------------------------------------------------------
+ - Analysis                                                                  -
+ -----------------------------------------------------------------------------}
 
 null :: Trie k v -> Bool
 null Nil = False
@@ -90,19 +105,23 @@ lookup k (Tip crumb v) | crumb == k = Just v
 lookup k (Node crumb offt mask arr) | nibbleShiftR k (offt + 1) == crumb
                                     , nib <- getNibble offt k
                                     , testBit mask (fromIntegral nib)
-                                    , pos <- maskToPos mask (fromIntegral nib) = lookup (nibbleMask offt k) (indexSmallArray arr pos)
+                                    , pos <- maskToPos mask (fromIntegral nib) = lookup (maskNibble offt k) (indexSmallArray arr pos)
                                     | otherwise = Nothing
 lookup k (Full crumb offt arr) | nibbleShiftR k (offt + 1) == crumb
-                               , nib <- getNibble offt k = lookup (nibbleMask offt k) (indexSmallArray arr (fromIntegral nib))
+                               , nib <- getNibble offt k = lookup (maskNibble offt k) (indexSmallArray arr (fromIntegral nib))
                                | otherwise = Nothing
 
 member :: NibbleQuery k => k -> Trie k v -> Bool
 member k t = isJust $ lookup k t
 
-toList :: NibbleQuery k => Trie k v -> [(k, v)]
-toList t = go zeroBits t [] where
+findWithDefault :: NibbleQuery k => v -> k -> Trie k v -> v
+findWithDefault def k t = fromMaybe def $ lookup k t
+
+
+foldrWithKey :: NibbleQuery k => (k -> v -> a -> a) -> a -> Trie k v -> a
+foldrWithKey f z t = go zeroBits t z where
   go _ Nil = id
-  go k (Tip crumb v) = ((k .|. crumb, v):)
+  go k (Tip crumb v) = f (k .|. crumb) v
   go k (Node crumb offt mask arr) = goMask 0 mask
     where goMask _ 0 = id
           goMask !n m | b <- leastSignificant m
@@ -116,6 +135,9 @@ toList t = go zeroBits t [] where
                      = go newk (indexSmallArray arr nib) . goArr (nib + 1)
           k' = k .|. nibbleShiftL crumb (offt + 1)
 
+toList :: NibbleQuery k => Trie k v -> [(k, v)]
+toList = foldrWithKey (\k v -> ((k, v):)) []
+
 instance (NibbleQuery k, Show v) => Show (Trie k v) where
   showsPrec d t = showParen (d > 10) $ showString "fromList " .
                     liftShowsPrec (liftShowsPrec2 showKey (showListWith $ showKey 0) showsPrec showList)
@@ -124,28 +146,78 @@ instance (NibbleQuery k, Show v) => Show (Trie k v) where
           showKey _ k | k == zeroBits = showString "0"
                       | otherwise = showString "0x" . showString ["0123456789ABCDEF" !! fromIntegral (getNibble i k) | i <- [logNibble k, logNibble k - 1 .. 0]]
 
+{-----------------------------------------------------------------------------
+ - Synthesis                                                                 -
+ -----------------------------------------------------------------------------}
+
 empty :: Trie k v
 empty = Nil
 
 singleton :: k -> v -> Trie k v
 singleton = Tip
 
-findWithDefault :: NibbleQuery k => v -> k -> Trie k v -> v
-findWithDefault def k t = fromMaybe def $ lookup k t
-
--- todo: inline
 insert :: NibbleQuery k => k -> v -> Trie k v -> Trie k v
-insert k v t = union (singleton k v) t
+insert = inline insertWith (\x _ -> x)
+
+insertWith :: NibbleQuery k => (v -> v -> v) -> k -> v -> Trie k v -> Trie k v
+insertWith f key v = go key where
+  go k Nil = Tip k v
+  go k t@(Tip crumb tv)
+    | k == crumb
+    , newv <- f v tv = if newv *==* tv
+                       then t
+                       else Tip crumb newv
+    | otherwise
+    , offt <- logNibble $ k `xor` crumb
+    , newcrumb <- nibbleShiftR crumb (offt + 1)
+    , nib <- getNibble offt k
+    , tNib <- getNibble offt crumb
+    , newk <- maskNibble offt k
+    , newt <- maskNode offt t
+    = Node newcrumb offt (bit (fromIntegral nib) .|. bit (fromIntegral tNib)) (makePair nib (Tip newk v) tNib newt)
+  go k t@(Node crumb offt mask arr)
+    | nibbleShiftR k (offt + 1) == crumb
+    , nib <- getNibble offt k
+    , pos <- maskToPos mask (fromIntegral nib)
+    , newk <- maskNibble offt k
+    = if | testBit mask (fromIntegral nib)
+         , child <- indexSmallArray arr pos
+         , newchild <- go newk child -> if newchild *==* child
+                                        then t
+                                        else Node crumb offt mask (updateSmallArray arr pos newchild)
+         | otherwise -> NF crumb offt (mask .|. bit (fromIntegral nib)) (insertSmallArray arr pos (Tip newk v))
+  go k t@(Full crumb offt arr)
+    | nibbleShiftR k (offt + 1) == crumb
+    , nib <- getNibble offt k
+    , newk <- maskNibble offt k
+    , child <- indexSmallArray arr (fromIntegral nib)
+    , newchild <- go newk child = if newchild *==* child
+                                  then t
+                                  else Full crumb offt (updateSmallArray arr (fromIntegral nib) newchild)
+  go k t@(NF crumb offt _ _)
+    | newofft <- logNibble $ nibbleShiftR k (offt + 1) `xor` crumb
+    , newcrumb <- nibbleShiftR crumb (newofft + 1)
+    , nib <- getNibble (newofft + offt + 1) k
+    , tNib <- getNibble newofft crumb
+    , newk <- maskNibble (newofft + offt + 1) k
+    , newt <- maskNode newofft t
+    = Node newcrumb (offt + newofft + 1) (bit (fromIntegral nib) .|. bit (fromIntegral tNib)) (makePair nib (Tip newk v) tNib newt)
+{-# INLINABLE insertWith #-}
 
 fromList :: NibbleQuery k => [(k, v)] -> Trie k v
 fromList = foldl' (\t (k, v) -> insert k v t) empty
 
+{-----------------------------------------------------------------------------
+ - Combinators                                                               -
+ -----------------------------------------------------------------------------}
+
 union :: NibbleQuery k => Trie k v -> Trie k v -> Trie k v
-union = unionWithKey (\_ x _ -> x)
+union = inline unionWithKey (\_ x _ -> x)
 
 unionWith :: NibbleQuery k => (v -> v -> v) -> Trie k v -> Trie k v -> Trie k v
-unionWith f = unionWithKey (\_ -> f)
+unionWith f = inline unionWithKey (\_ -> f)
 
+-- todo: efficient key manipulation
 unionWithKey :: NibbleQuery k => (k -> v -> v -> v) -> Trie k v -> Trie k v -> Trie k v
 unionWithKey f = go zeroBits where
   go _ l Nil = l
@@ -312,6 +384,48 @@ unionWithKey f = go zeroBits where
   go _ (Tip _ _) (Node _ _ _ _) = error "isProperSubTrie and isDisjointTrie cannot miss that"
   go _ (Tip _ _) (Full _ _ _) = error "isProperSubTrie and isDisjointTrie cannot miss that"
 
+  isProperSubTrie :: NibbleQuery k => Trie k v -> Trie k v -> Maybe (Word8, Offset)
+  isProperSubTrie _ (Tip _ _) = Nothing
+  isProperSubTrie (Tip lcrumb _) (NF rcrumb rofft _ _) = if nibbleShiftR lcrumb (rofft + 1) == rcrumb
+                                                         then Just (getNibble rofft lcrumb, rofft)
+                                                         else Nothing
+  isProperSubTrie (NF lcrumb lofft _ _) (NF rcrumb rofft _ _) = if lofft < rofft && nibbleShiftR lcrumb (rofft - lofft) == rcrumb
+                                                                then Just (getNibble (rofft - lofft - 1) lcrumb, rofft - lofft - 1)
+                                                                else Nothing
+  isProperSubTrie Nil _ = error "isProperSubTrie Nil _"
+  isProperSubTrie _ Nil = error "isProperSubTrie _ Nil"
+
+  isDisjointTrie :: NibbleQuery k => Trie k v -> Trie k v -> Maybe (k, Offset, Word8, Offset, Word8, Offset)
+  isDisjointTrie (Tip lcrumb _) (Tip rcrumb _)
+    | lcrumb /= rcrumb
+    , offt <- logNibble $ lcrumb `xor` rcrumb
+    , crumb <- nibbleShiftR lcrumb (offt + 1) = Just (crumb, offt, getNibble offt lcrumb, offt, getNibble offt rcrumb, offt)
+    | otherwise = Nothing
+  isDisjointTrie (Tip lcrumb _) (NF rcrumb rofft _ _)
+    | offt <- logNibble $ nibbleShiftR lcrumb (rofft + 1) `xor` rcrumb
+    , crumb <- nibbleShiftR rcrumb (offt + 1) = Just (crumb, offt + rofft + 1, getNibble (offt + rofft + 1) lcrumb, offt + rofft + 1, getNibble offt rcrumb, offt)
+  isDisjointTrie (NF lcrumb lofft _ _) (Tip rcrumb _)
+    | offt <- logNibble $ lcrumb `xor` nibbleShiftR rcrumb (lofft + 1)
+    , crumb <- nibbleShiftR lcrumb (offt + 1) = Just (crumb, offt + lofft + 1, getNibble offt lcrumb, offt, getNibble (offt + lofft + 1) rcrumb, offt + lofft + 1)
+  isDisjointTrie (NF lcrumb lofft _ _) (NF rcrumb rofft _ _) = case compare lofft rofft of
+    LT | offt <- logNibble $ nibbleShiftR lcrumb (rofft - lofft) `xor` rcrumb
+       , crumb <- nibbleShiftR rcrumb (offt + 1)
+       -> Just (crumb, offt + rofft + 1, getNibble (offt + rofft - lofft) lcrumb, offt + rofft - lofft, getNibble offt rcrumb, offt)
+    GT | offt <- logNibble $ lcrumb `xor` nibbleShiftR rcrumb (lofft - rofft)
+       , crumb <- nibbleShiftR lcrumb (offt + 1)
+       -> Just (crumb, offt + lofft + 1, getNibble offt lcrumb, offt, getNibble (offt + lofft - rofft) rcrumb, offt + lofft - rofft)
+    EQ | lcrumb /= rcrumb
+       , offt <- logNibble $ lcrumb `xor` rcrumb
+       , crumb <- nibbleShiftR lcrumb (offt + 1)
+       -> Just (crumb, offt + lofft + 1, getNibble offt lcrumb, offt, getNibble offt rcrumb, offt)
+       | otherwise -> Nothing
+  isDisjointTrie Nil _ = error "isDisjointTrie Nil _"
+  isDisjointTrie _ Nil = error "isDisjointTrie _ Nil"
+{-# INLINABLE unionWithKey #-}
+
+{-----------------------------------------------------------------------------
+ - Utilities                                                                 -
+ -----------------------------------------------------------------------------}
 
 (*==*) :: a -> a -> Bool
 x *==* y = isTrue# (reallyUnsafePtrEquality# x y)
@@ -333,49 +447,11 @@ updateSmallArray a pos v = runST $ do
   unsafeFreezeSmallArray ma
 
 
-isProperSubTrie :: NibbleQuery k => Trie k v -> Trie k v -> Maybe (Word8, Offset)
-isProperSubTrie _ (Tip _ _) = Nothing
-isProperSubTrie (Tip lcrumb _) (NF rcrumb rofft _ _) = if nibbleShiftR lcrumb (rofft + 1) == rcrumb
-                                                       then Just (getNibble rofft lcrumb, rofft)
-                                                       else Nothing
-isProperSubTrie (NF lcrumb lofft _ _) (NF rcrumb rofft _ _) = if lofft < rofft && nibbleShiftR lcrumb (rofft - lofft) == rcrumb
-                                                              then Just (getNibble (rofft - lofft - 1) lcrumb, rofft - lofft - 1)
-                                                              else Nothing
-isProperSubTrie Nil _ = error "isProperSubTrie Nil _"
-isProperSubTrie _ Nil = error "isProperSubTrie _ Nil"
-
-isDisjointTrie :: NibbleQuery k => Trie k v -> Trie k v -> Maybe (k, Offset, Word8, Offset, Word8, Offset)
-isDisjointTrie (Tip lcrumb _) (Tip rcrumb _)
-  | lcrumb /= rcrumb
-  , offt <- logNibble $ lcrumb `xor` rcrumb
-  , crumb <- nibbleShiftR lcrumb (offt + 1) = Just (crumb, offt, getNibble offt lcrumb, offt, getNibble offt rcrumb, offt)
-  | otherwise = Nothing
-isDisjointTrie (Tip lcrumb _) (NF rcrumb rofft _ _)
-  | offt <- logNibble $ nibbleShiftR lcrumb (rofft + 1) `xor` rcrumb
-  , crumb <- nibbleShiftR rcrumb (offt + 1) = Just (crumb, offt + rofft + 1, getNibble (offt + rofft + 1) lcrumb, offt + rofft + 1, getNibble offt rcrumb, offt)
-isDisjointTrie (NF lcrumb lofft _ _) (Tip rcrumb _)
-  | offt <- logNibble $ lcrumb `xor` nibbleShiftR rcrumb (lofft + 1)
-  , crumb <- nibbleShiftR lcrumb (offt + 1) = Just (crumb, offt + lofft + 1, getNibble offt lcrumb, offt, getNibble (offt + lofft + 1) rcrumb, offt + lofft + 1)
-isDisjointTrie (NF lcrumb lofft _ _) (NF rcrumb rofft _ _) = case compare lofft rofft of
-  LT | offt <- logNibble $ nibbleShiftR lcrumb (rofft - lofft) `xor` rcrumb
-     , crumb <- nibbleShiftR rcrumb (offt + 1)
-     -> Just (crumb, offt + rofft + 1, getNibble (offt + rofft - lofft) lcrumb, offt + rofft - lofft, getNibble offt rcrumb, offt)
-  GT | offt <- logNibble $ lcrumb `xor` nibbleShiftR rcrumb (lofft - rofft)
-     , crumb <- nibbleShiftR lcrumb (offt + 1)
-     -> Just (crumb, offt + lofft + 1, getNibble offt lcrumb, offt, getNibble (offt + lofft - rofft) rcrumb, offt + lofft - rofft)
-  EQ | lcrumb /= rcrumb
-     , offt <- logNibble $ lcrumb `xor` rcrumb
-     , crumb <- nibbleShiftR lcrumb (offt + 1)
-     -> Just (crumb, offt + lofft + 1, getNibble offt lcrumb, offt, getNibble offt rcrumb, offt)
-     | otherwise -> Nothing
-isDisjointTrie Nil _ = error "isDisjointTrie Nil _"
-isDisjointTrie _ Nil = error "isDisjointTrie _ Nil"
-
 maskNode :: NibbleQuery k => Offset -> Trie k v -> Trie k v
 maskNode _ Nil = Nil
-maskNode o (Tip crumb v) = Tip (nibbleMask o crumb) v
-maskNode o (Node crumb offt mask arr) = Node (nibbleMask o crumb) offt mask arr
-maskNode o (Full crumb offt arr) = Full (nibbleMask o crumb) offt arr
+maskNode o (Tip crumb v) = Tip (maskNibble o crumb) v
+maskNode o (Node crumb offt mask arr) = Node (maskNibble o crumb) offt mask arr
+maskNode o (Full crumb offt arr) = Full (maskNibble o crumb) offt arr
 
 makePair :: Ord b => b -> a -> b -> a -> SmallArray a
 makePair lNib l rNib r = if lNib < rNib then makeArr l r else makeArr r l
