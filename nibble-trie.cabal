@@ -14,7 +14,7 @@ build-type:          Simple
 
 library
   exposed-modules:     Data.Trie.Nibble.Internal,
-                       Data.Trie.Nibble.NibbleQuery
+                       Data.Trie.Nibble.Internal.NatOps
   build-depends:       base == 4.*,
                        ghc-prim,
                        integer-gmp,
